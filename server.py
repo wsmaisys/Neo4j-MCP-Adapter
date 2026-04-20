@@ -258,10 +258,7 @@ def _configure_http_transport() -> None:
         if host == "*":
             allowed_hosts = ["*"]
             break
-        if ":" in host or host.startswith("["):
-            allowed_hosts.append(host)
-        else:
-            allowed_hosts.append(f"{host}:*")
+        allowed_hosts.append(host)
     transport_security.allowed_hosts = allowed_hosts
 
 

@@ -2,7 +2,11 @@
   "mcpServers": {
     "neo4j": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://your-deployed-mcp.example.com/mcp"]
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://neo4j-mcp-adapter-736344442420.us-central1.run.app/mcp"
+      ]
     }
   }
 }

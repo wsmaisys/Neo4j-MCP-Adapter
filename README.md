@@ -1,21 +1,19 @@
-# Neo4j MCP Adapter Deployment Guide
+# Neo4j MCP Adapter
 
-This folder contains the deployed Neo4j MCP adapter that serves Streamable HTTP at `/mcp`.
+This repo contains a FastMCP server that exposes Neo4j tools over Streamable HTTP at `/mcp`.
 
-## Files
+## What Runs In Production
 
-- `server.py` runs the MCP adapter.
-- `.env` holds the server-side Neo4j connection and adapter runtime settings.
-- `docker-compose.yml` starts the adapter container.
-- `client_config.example.json` is only for the MCP client side.
+- Cloud Run service: `neo4j-mcp-adapter`
+- Public URL: `https://neo4j-mcp-adapter-736344442420.us-central1.run.app`
+- MCP endpoint: `https://neo4j-mcp-adapter-736344442420.us-central1.run.app/mcp`
+- Transport: `streamable_http`
 
-## How it fits together
+## Server Configuration
 
-- The client talks only to the MCP adapter URL.
-- The adapter talks to Neo4j over Bolt.
-- Neo4j credentials never go in the client config.
+The server reads its runtime settings from environment variables.
 
-## Required server-side variables
+Required values:
 
 - `NEO4J_URI`
 - `NEO4J_USERNAME`
@@ -25,9 +23,25 @@ This folder contains the deployed Neo4j MCP adapter that serves Streamable HTTP 
 - `NEO4J_MCP_SERVER_PORT`
 - `NEO4J_MCP_SERVER_PATH`
 
-By default, the adapter now accepts all hosts so Cloud Run's `run.app` host header works out of the box. For production, set `NEO4J_MCP_SERVER_ALLOWED_HOSTS` to your exact deployment host if you want to restrict access further.
+Recommended Cloud Run settings for this deployment:
 
-## Run with Docker Compose
+- `NEO4J_MCP_SERVER_HOST=0.0.0.0`
+- `NEO4J_MCP_SERVER_PORT=8080`
+- `NEO4J_MCP_SERVER_PATH=/mcp/`
+- `NEO4J_MCP_SERVER_STATELESS=true`
+- `NEO4J_MCP_SERVER_ALLOWED_HOSTS=neo4j-mcp-adapter-736344442420.us-central1.run.app`
+
+Use `NEO4J_MCP_SERVER_ALLOWED_HOSTS=*` only for quick testing.
+
+## Local Run
+
+The simplest local path is:
+
+```bash
+python server.py
+```
+
+For Docker:
 
 ```bash
 docker compose up --build -d
@@ -35,9 +49,20 @@ docker compose up --build -d
 
 The compose file reads `.env` automatically.
 
-## Client config example
+## Client Configuration
 
-Use the public MCP URL in the client's MCP config:
+The Python client uses Streamable HTTP and must point at `/mcp` without a trailing slash.
+
+```python
+MCP_CONFIG = {
+  "neo4j-adapter": {
+    "url": "https://neo4j-mcp-adapter-736344442420.us-central1.run.app/mcp",
+    "transport": "streamable_http",
+  }
+}
+```
+
+If you use the MCP remote CLI, use the same endpoint:
 
 ```json
 {
@@ -47,15 +72,52 @@ Use the public MCP URL in the client's MCP config:
       "args": [
         "-y",
         "mcp-remote",
-        "https://neo4j-mcp-adapter-736344442420.us-central1.run.app"
+        "https://neo4j-mcp-adapter-736344442420.us-central1.run.app/mcp"
       ]
     }
   }
 }
 ```
 
+## Quick Validation
+
+Run the client:
+
+```bash
+python mcp_client.py
+```
+
+Probe the MCP handshake:
+
+```bash
+curl -i -X POST https://neo4j-mcp-adapter-736344442420.us-central1.run.app/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  --data-binary @mcp-init.json
+```
+
+Where `mcp-init.json` contains a minimal JSON-RPC `initialize` request.
+
+## Free Tier Notes
+
+The current Cloud Run deployment is kept small to stay in the free tier:
+
+- `1 vCPU`
+- `512 MiB` memory
+- `max instances = 1`
+- request-based billing
+
+Cloud Run free-tier limits in `us-central1` are the main guardrails to watch:
+
+- `2 million` requests per month
+- `180,000` vCPU-seconds per month
+- `360,000` GiB-seconds per month
+- `1 GB` outbound data transfer from North America per month
+
+Artifact Registry also has a free storage tier, so keep old images cleaned up.
+
 ## Notes
 
 - Keep `.env` out of source control.
-- Put the adapter behind HTTPS for production.
-- The adapter is already configured to fail fast if required environment variables are missing.
+- Prefer HTTPS for production deployments.
+- The adapter fails fast if the required Neo4j environment variables are missing.
