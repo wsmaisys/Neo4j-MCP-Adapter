@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "neo4j": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://your-deployed-mcp.example.com/mcp"]
+    }
+  }
+}
