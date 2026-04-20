@@ -451,3 +451,38 @@ def main(
 
 if __name__ == "__main__":
     main()
+
+# import asyncio
+# from flask import jsonify
+
+# def cloud_run_entry(request):
+#     """
+#     Standard HTTP entry point for Google Cloud.
+#     Bypasses the 'as_flask_app' error by calling tools directly.
+#     """
+#     # 1. Parse the incoming JSON
+#     request_json = request.get_json(silent=True)
+#     if not request_json:
+#         return jsonify({"error": "No JSON payload provided"}), 400
+
+#     tool_name = request_json.get("tool")
+#     arguments = request_json.get("arguments", {})
+
+#     try:
+#         # 2. Route the tool name to the actual function
+#         if tool_name == "get_neo4j_schema":
+#             result = asyncio.run(get_neo4j_schema(**arguments))
+#             return jsonify(result)
+        
+#         elif tool_name == "read_neo4j_cypher":
+#             result = asyncio.run(read_neo4j_cypher(**arguments))
+#             return jsonify(result)
+        
+#         elif tool_name == "write_neo4j_cypher":
+#             result = asyncio.run(write_neo4j_cypher(**arguments))
+#             return jsonify(result)
+
+#         return jsonify({"error": f"Tool '{tool_name}' not found"}), 404
+
+#     except Exception as e:
+#         return jsonify({"error": str(e)}), 500

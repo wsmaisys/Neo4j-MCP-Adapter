@@ -16,6 +16,6 @@ COPY server.py /app/server.py
 RUN pip install --upgrade pip \
     && pip install -r /app/requirements.txt
 
-EXPOSE 8000
+EXPOSE 8080
 
 CMD ["python", "server.py"]
