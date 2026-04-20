@@ -6,7 +6,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 MCP_CONFIG = {
     "neo4j-adapter": {
         "url": "https://neo4j-mcp-adapter-736344442420.us-central1.run.app/mcp/",
-        "transport": "http",
+        "transport": "streamable-http",
     }
 }
 

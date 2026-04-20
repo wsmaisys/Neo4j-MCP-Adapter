@@ -196,7 +196,7 @@ NEO4J_MCP_SERVER_ALLOW_ORIGINS = _split_csv(
 )
 NEO4J_MCP_SERVER_ALLOWED_HOSTS = _split_csv(
     os.getenv("NEO4J_MCP_SERVER_ALLOWED_HOSTS"),
-    [],
+    ["*"],
 )
 NEO4J_MCP_SERVER_STATELESS = _env_bool("NEO4J_MCP_SERVER_STATELESS", True)
 NEO4J_READ_ONLY = _env_bool("NEO4J_READ_ONLY", False)
@@ -255,6 +255,9 @@ def _configure_http_transport() -> None:
 
     allowed_hosts = []
     for host in NEO4J_MCP_SERVER_ALLOWED_HOSTS:
+        if host == "*":
+            allowed_hosts = ["*"]
+            break
         if ":" in host or host.startswith("["):
             allowed_hosts.append(host)
         else:

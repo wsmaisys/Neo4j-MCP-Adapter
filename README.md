@@ -25,6 +25,8 @@ This folder contains the deployed Neo4j MCP adapter that serves Streamable HTTP 
 - `NEO4J_MCP_SERVER_PORT`
 - `NEO4J_MCP_SERVER_PATH`
 
+By default, the adapter now accepts all hosts so Cloud Run's `run.app` host header works out of the box. For production, set `NEO4J_MCP_SERVER_ALLOWED_HOSTS` to your exact deployment host if you want to restrict access further.
+
 ## Run with Docker Compose
 
 ```bash
@@ -42,7 +44,11 @@ Use the public MCP URL in the client's MCP config:
   "mcpServers": {
     "neo4j": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "https://neo4j-mcp-adapter-736344442420.us-central1.run.app"]
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://neo4j-mcp-adapter-736344442420.us-central1.run.app"
+      ]
     }
   }
 }
