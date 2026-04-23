@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -23,6 +23,7 @@ logger = logging.getLogger("mcp_neo4j_cypher")
 logger.setLevel(logging.INFO)
 
 
+# Exceptions and small parsing helpers keep configuration and tool errors consistent.
 class ToolError(Exception):
     pass
 
@@ -71,6 +72,7 @@ def _split_csv(value: str | None, default: list[str]) -> list[str]:
 
 
 def _value_sanitize(value: Any, list_limit: int = 128) -> Any:
+    # Keep nested payloads shallow enough for MCP responses and token limits.
     if isinstance(value, dict):
         sanitized: dict[str, Any] = {}
         for key, item in value.items():
@@ -94,6 +96,7 @@ def _value_sanitize(value: Any, list_limit: int = 128) -> Any:
 
 
 def _truncate_string_to_tokens(text: str, token_limit: int, model: str = "gpt-4") -> str:
+    # If tiktoken is missing, return the original text instead of failing the server.
     if tiktoken is None:
         return text
 
@@ -107,10 +110,21 @@ def _truncate_string_to_tokens(text: str, token_limit: int, model: str = "gpt-4"
 def _format_namespace(namespace: str) -> str:
     if not namespace:
         return ""
+    # Tool names use a trailing dash separator when a namespace is configured.
     return namespace if namespace.endswith("-") else f"{namespace}-"
 
 
+def _normalize_mount_path(path: str) -> str:
+    # Accept /mcp and /mcp/ from config, but store one canonical form everywhere.
+    normalized = (path or "/mcp").strip()
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    normalized = normalized.rstrip("/")
+    return normalized or "/"
+
+
 def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    # Strip noisy metadata while preserving the fields clients usually care about.
     cleaned: dict[str, Any] = {}
 
     for key, entry in schema.items():
@@ -181,6 +195,7 @@ def _log_tool_start(tool_name: str, extra: str = "") -> None:
         logger.info("Running `%s`", tool_name)
 
 
+# Runtime configuration is resolved up front so the server fails fast on bad env state.
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
@@ -189,7 +204,7 @@ NEO4J_NAMESPACE = os.getenv("NEO4J_NAMESPACE", "")
 NEO4J_TRANSPORT = os.getenv("NEO4J_TRANSPORT", "http")
 NEO4J_MCP_SERVER_HOST = os.getenv("NEO4J_MCP_SERVER_HOST", "0.0.0.0")
 NEO4J_MCP_SERVER_PORT = _env_int("NEO4J_MCP_SERVER_PORT", 8000)
-NEO4J_MCP_SERVER_PATH = os.getenv("NEO4J_MCP_SERVER_PATH", "/mcp/")
+NEO4J_MCP_SERVER_PATH = _normalize_mount_path(os.getenv("NEO4J_MCP_SERVER_PATH", "/mcp"))
 NEO4J_MCP_SERVER_ALLOW_ORIGINS = _split_csv(
     os.getenv("NEO4J_MCP_SERVER_ALLOW_ORIGINS"),
     [],
@@ -204,6 +219,7 @@ NEO4J_SCHEMA_SAMPLE_SIZE = _env_int("NEO4J_SCHEMA_SAMPLE_SIZE", 1000)
 NEO4J_READ_TIMEOUT = _env_int("NEO4J_READ_TIMEOUT", 30)
 NEO4J_RESPONSE_TOKEN_LIMIT = _env_optional_int("NEO4J_RESPONSE_TOKEN_LIMIT")
 
+# Build the MCP app once so tool registration happens at import time.
 mcp = FastMCP("mcp-neo4j-cypher", stateless_http=True)
 namespace_prefix = _format_namespace(NEO4J_NAMESPACE)
 
@@ -231,6 +247,7 @@ def _text_result(text: str) -> CallToolResult:
 
 
 async def _is_write_query(query: str, params: dict[str, Any] | None = None) -> bool:
+    # EXPLAIN lets us classify the query without executing the mutation.
     _, summary, _ = await driver.execute_query(
         query_=f"EXPLAIN {query}",
         parameters_=params or {},
@@ -240,11 +257,8 @@ async def _is_write_query(query: str, params: dict[str, Any] | None = None) -> b
     return "w" in (summary.query_type or "")
 
 
-def create_mcp_server() -> FastMCP:
-    return mcp
-
-
 def _configure_http_transport() -> None:
+    # Keep all transport settings in one place so main() stays focused.
     mcp.settings.host = NEO4J_MCP_SERVER_HOST
     mcp.settings.port = NEO4J_MCP_SERVER_PORT
     mcp.settings.mount_path = NEO4J_MCP_SERVER_PATH
@@ -262,6 +276,7 @@ def _configure_http_transport() -> None:
     transport_security.allowed_hosts = allowed_hosts
 
 
+# Tool handlers are grouped together below in the same order the client usually reads them.
 @mcp.tool(
     name=namespace_prefix + "get_neo4j_schema",
     title="Get Neo4j Schema",
@@ -303,6 +318,7 @@ async def get_neo4j_schema(
     """
     effective_sample_size = sample_size if sample_size else NEO4J_SCHEMA_SAMPLE_SIZE
     _log_tool_start("get_neo4j_schema", f"with sample size {effective_sample_size}.")
+    # APOC schema sampling is the narrowest way to inspect the graph shape.
     get_schema_query = f"CALL apoc.meta.schema({{sample: {effective_sample_size}}}) YIELD value RETURN value"
 
     try:
@@ -356,6 +372,7 @@ async def read_neo4j_cypher(
     ),
 ) -> CallToolResult:
     """Execute a read Cypher query on the neo4j database."""
+    # Reject writes early so this handler stays read-only by construction.
     if await _is_write_query(query, params):
         raise ToolError("Only MATCH queries are allowed for read-query")
 
@@ -384,55 +401,55 @@ async def read_neo4j_cypher(
     return _text_result(results_json_str)
 
 
-@mcp.tool(
-    name=namespace_prefix + "write_neo4j_cypher",
-    title="Write Neo4j Cypher",
-    description=(
-        "Run a write Cypher query against Neo4j and return the write counters as JSON text. "
-        "Provide query plus optional params. Use only when the user explicitly wants mutation."
-    ),
-    annotations=ToolAnnotations(
+if not NEO4J_READ_ONLY:
+
+    @mcp.tool(
+        name=namespace_prefix + "write_neo4j_cypher",
         title="Write Neo4j Cypher",
-        readOnlyHint=False,
-        destructiveHint=True,
-        idempotentHint=False,
-        openWorldHint=True,
-    ),
-    meta={
-        "tags": ["neo4j", "cypher", "write", "mutation"],
-        "surface": "data-mutation",
-    },
-)
-async def write_neo4j_cypher(
-    query: str = Field(..., description="The Cypher query to execute."),
-    params: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Optional Cypher parameters passed as a JSON object.",
-    ),
-) -> CallToolResult:
-    """Execute a write Cypher query on the neo4j database."""
-    if NEO4J_READ_ONLY:
-        raise ToolError("Write queries are disabled in read-only mode")
+        description=(
+            "Run a write Cypher query against Neo4j and return the write counters as JSON text. "
+            "Provide query plus optional params. Use only when the user explicitly wants mutation."
+        ),
+        annotations=ToolAnnotations(
+            title="Write Neo4j Cypher",
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+        meta={
+            "tags": ["neo4j", "cypher", "write", "mutation"],
+            "surface": "data-mutation",
+        },
+    )
+    async def write_neo4j_cypher(
+        query: str = Field(..., description="The Cypher query to execute."),
+        params: dict[str, Any] = Field(
+            default_factory=dict,
+            description="Optional Cypher parameters passed as a JSON object.",
+        ),
+    ) -> CallToolResult:
+        """Execute a write Cypher query on the neo4j database."""
+        # Confirm the query is actually a write before executing it.
+        if not await _is_write_query(query, params):
+            raise ToolError("Only write queries are allowed for write-query")
 
-    if not await _is_write_query(query, params):
-        raise ToolError("Only write queries are allowed for write-query")
+        _log_tool_start("write_neo4j_cypher")
 
-    _log_tool_start("write_neo4j_cypher")
+        try:
+            _, summary, _ = await driver.execute_query(
+                query,
+                parameters_=params,
+                database_=NEO4J_DATABASE,
+            )
+        except Neo4jError as exc:
+            logger.error("Neo4j Error executing write query: %s\n%s\n%s", exc, query, params)
+            raise ToolError(f"Neo4j Error: {exc}\n{query}\n{params}") from exc
+        except Exception as exc:
+            logger.error("Error executing write query: %s\n%s\n%s", exc, query, params)
+            raise ToolError(f"Error: {exc}\n{query}\n{params}") from exc
 
-    try:
-        _, summary, _ = await driver.execute_query(
-            query,
-            parameters_=params,
-            database_=NEO4J_DATABASE,
-        )
-    except Neo4jError as exc:
-        logger.error("Neo4j Error executing write query: %s\n%s\n%s", exc, query, params)
-        raise ToolError(f"Neo4j Error: {exc}\n{query}\n{params}") from exc
-    except Exception as exc:
-        logger.error("Error executing write query: %s\n%s\n%s", exc, query, params)
-        raise ToolError(f"Error: {exc}\n{query}\n{params}") from exc
-
-    return _text_result(json.dumps(summary.counters.__dict__, default=str))
+        return _text_result(json.dumps(summary.counters.__dict__, default=str))
 
 
 def main(
@@ -450,39 +467,5 @@ def main(
 
 
 if __name__ == "__main__":
+    # Allow direct execution without requiring a separate launcher script.
     main()
-
-# import asyncio
-# from flask import jsonify
-
-# def cloud_run_entry(request):
-#     """
-#     Standard HTTP entry point for Google Cloud.
-#     Bypasses the 'as_flask_app' error by calling tools directly.
-#     """
-#     # 1. Parse the incoming JSON
-#     request_json = request.get_json(silent=True)
-#     if not request_json:
-#         return jsonify({"error": "No JSON payload provided"}), 400
-
-#     tool_name = request_json.get("tool")
-#     arguments = request_json.get("arguments", {})
-
-#     try:
-#         # 2. Route the tool name to the actual function
-#         if tool_name == "get_neo4j_schema":
-#             result = asyncio.run(get_neo4j_schema(**arguments))
-#             return jsonify(result)
-        
-#         elif tool_name == "read_neo4j_cypher":
-#             result = asyncio.run(read_neo4j_cypher(**arguments))
-#             return jsonify(result)
-        
-#         elif tool_name == "write_neo4j_cypher":
-#             result = asyncio.run(write_neo4j_cypher(**arguments))
-#             return jsonify(result)
-
-#         return jsonify({"error": f"Tool '{tool_name}' not found"}), 404
-
-#     except Exception as e:
-#         return jsonify({"error": str(e)}), 500
