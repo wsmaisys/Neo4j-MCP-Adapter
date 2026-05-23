@@ -1,10 +1,12 @@
 import asyncio
+import os
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-# Removed the subprocess/gcloud token logic
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8080/mcp")
+
 MCP_CONFIG = {
     "neo4j-adapter": {
-        "url": "https://neo4j-mcp-adapter-736344442420.us-central1.run.app/mcp",
+        "url": MCP_SERVER_URL,
         "transport": "streamable_http",
     }
 }
@@ -16,7 +18,7 @@ async def main() -> None:
 
         print("Connected to MCP server(s):")
         for server_name in MCP_CONFIG:
-            print(f"- {server_name}")
+            print(f"- {server_name}: {MCP_CONFIG[server_name]['url']}")
 
         print("\nAvailable tools:")
         for tool in tools:

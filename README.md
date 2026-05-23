@@ -9,6 +9,7 @@ Only the `.env` file changes for each person or deployment.
 
 - Connects to your Neo4j database
 - Lets an MCP client read Neo4j data over HTTP
+- Exposes secure HyreFast workspace-aware read tools by default
 - Can run locally or on Google Cloud Run
 - Can be locked to read-only mode so no write tool is exposed
 
@@ -61,9 +62,13 @@ NEO4J_MCP_SERVER_ALLOWED_HOSTS=*
 NEO4J_MCP_SERVER_STATELESS=true
 
 NEO4J_READ_ONLY=true
+NEO4J_EXPOSE_RAW_TOOLS=false
 NEO4J_SCHEMA_SAMPLE_SIZE=1000
 NEO4J_READ_TIMEOUT=30
 NEO4J_RESPONSE_TOKEN_LIMIT=
+
+HYREFAST_WORKSPACE_ID=your-workspace-id
+HYREFAST_ALLOW_WORKSPACE_ID_PARAM=false
 ```
 
 If you want write access, change:
@@ -141,6 +146,66 @@ If you only change `.env` values in Cloud Run and redeploy, the code does not ne
 
 Important: use `/mcp` as the path. Do not add a trailing slash in client URLs or config files.
 
+### Required Cloud Run environment variables for secure mode
+
+When deploying this adapter for HyreFast workspace-user chat, make sure Cloud Run has these values:
+
+```env
+NEO4J_READ_ONLY=true
+NEO4J_EXPOSE_RAW_TOOLS=false
+```
+
+For temporary POC testing with a UI popup that asks for `workspace_id`, use:
+
+```env
+HYREFAST_WORKSPACE_ID=
+HYREFAST_ALLOW_WORKSPACE_ID_PARAM=true
+```
+
+In this mode, the caller may pass `workspace_id` in the `secure_read_cypher` params object. This is only for POC testing because the caller controls the workspace id.
+
+For a fixed server-side workspace, use:
+
+```env
+HYREFAST_WORKSPACE_ID=your-workspace-id
+HYREFAST_ALLOW_WORKSPACE_ID_PARAM=false
+```
+
+For the deployed Cloud Run service, keep the allowed host set to the Cloud Run service hostname:
+
+```env
+NEO4J_MCP_SERVER_ALLOWED_HOSTS=neo4j-mcp-adapter-736344442420.us-central1.run.app
+```
+
+If testing locally, override the host allowlist in the terminal instead:
+
+```powershell
+$env:NEO4J_MCP_SERVER_ALLOWED_HOSTS="127.0.0.1:8080,localhost:8080,127.0.0.1,localhost"
+```
+
+### Post-deploy verification
+
+After pushing changes and waiting for CI/CD to redeploy Cloud Run, verify the deployed adapter:
+
+```powershell
+cd "C:\Yegawasim\GitHub\Neo4j-MCP-Adapter"
+$env:MCP_SERVER_URL="https://neo4j-mcp-adapter-736344442420.us-central1.run.app/mcp"
+python -B mcp_client.py
+```
+
+Expected tools:
+
+```text
+secure_get_schema
+secure_read_cypher
+```
+
+If you see raw tools like `read_neo4j_cypher`, `get_neo4j_schema`, or `write_neo4j_cypher`, check that:
+
+```env
+NEO4J_EXPOSE_RAW_TOOLS=false
+```
+
 ## Read-only mode
 
 If you want this adapter to be safe for general use, set:
@@ -150,6 +215,62 @@ NEO4J_READ_ONLY=true
 ```
 
 In read-only mode, the write tool is not registered at all.
+
+## Secure HyreFast tools
+
+By default, the adapter exposes these workspace-safe tools:
+
+```text
+secure_get_schema
+secure_read_cypher
+```
+
+`secure_read_cypher` allows flexible Text2Cypher, but enforces these rules:
+
+- Write operations are blocked.
+- Candidate and candidate-side labels must be scoped through `Workspace`.
+- The required candidate pattern is:
+
+```cypher
+(:Workspace {workspace_id: $workspace_id})-[:LISTED_CANDIDATE]->(:Candidate)
+```
+
+- The adapter injects `workspace_id`.
+- Global taxonomy reads over `Skill`, `Category`, `Subcategory`, `Alias`, `Tag`, `JobRole`, and `Taxonomy` can run without workspace scope.
+
+For normal deployment, set the workspace on the server:
+
+```env
+HYREFAST_WORKSPACE_ID=your-workspace-id
+HYREFAST_ALLOW_WORKSPACE_ID_PARAM=false
+```
+
+For temporary POC testing only, you may let the caller pass `workspace_id` in tool params:
+
+```env
+HYREFAST_WORKSPACE_ID=
+HYREFAST_ALLOW_WORKSPACE_ID_PARAM=true
+```
+
+This is useful if the POC UI shows a startup popup asking for a workspace id before chat begins. Do not treat this as production tenant security, because the caller can choose the workspace id.
+
+## Raw Neo4j tools
+
+Raw tools are disabled by default:
+
+```text
+get_neo4j_schema
+read_neo4j_cypher
+write_neo4j_cypher
+```
+
+If you need them for local debugging, explicitly set:
+
+```env
+NEO4J_EXPOSE_RAW_TOOLS=true
+```
+
+Keep this false for workspace-user deployments.
 
 ## Files in this repo
 

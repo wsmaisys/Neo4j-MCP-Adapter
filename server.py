@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -195,6 +196,103 @@ def _log_tool_start(tool_name: str, extra: str = "") -> None:
         logger.info("Running `%s`", tool_name)
 
 
+def _maybe_tool(enabled: bool, *args: Any, **kwargs: Any):
+    def decorator(func):
+        if enabled:
+            return mcp.tool(*args, **kwargs)(func)
+        return func
+
+    return decorator
+
+
+def _normalized_query(query: str) -> str:
+    return " ".join(query.upper().split())
+
+
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    escaped = re.escape(keyword).replace(r"\ ", r"\s+")
+    return re.compile(rf"(?<![A-Z0-9_]){escaped}(?![A-Z0-9_])", re.IGNORECASE)
+
+
+def _touches_private_label(query: str) -> bool:
+    return any(
+        re.search(rf":\s*{re.escape(label)}\b", query, flags=re.IGNORECASE)
+        for label in PRIVATE_LABELS
+    )
+
+
+def _candidate_labels(query: str) -> list[str | None]:
+    matches = re.finditer(
+        r"\(\s*([A-Za-z_][A-Za-z0-9_]*)?\s*:\s*Candidate\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+    return [match.group(1) for match in matches]
+
+
+def _workspace_scoped_candidate_variable(query: str) -> str | None:
+    pattern = re.compile(
+        r"\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*)?:\s*Workspace\s*"
+        r"\{[^}]*\bworkspace_id\s*:\s*\$workspace_id\b[^}]*\}\s*\)"
+        r"\s*-\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*)?:?\s*LISTED_CANDIDATE\s*\]\s*->\s*"
+        r"\(\s*([A-Za-z_][A-Za-z0-9_]*)?\s*:\s*Candidate\b",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    match = pattern.search(query)
+    return match.group(1) if match else None
+
+
+def _has_workspace_scope(query: str) -> bool:
+    return _workspace_scoped_candidate_variable(query) is not None
+
+
+def _validate_secure_read_query(query: str) -> None:
+    for keyword in BLOCKED_READ_KEYWORDS:
+        if _keyword_pattern(keyword).search(query):
+            raise ToolError(f"Blocked Cypher operation in read-only tool: {keyword}")
+
+    if not _touches_private_label(query):
+        return
+
+    scoped_candidate = _workspace_scoped_candidate_variable(query)
+    if scoped_candidate is None:
+        raise ToolError(
+            "Private candidate queries must be scoped through "
+            "(:Workspace {workspace_id: $workspace_id})-[:LISTED_CANDIDATE]->(:Candidate)."
+        )
+
+    for candidate_var in _candidate_labels(query):
+        if candidate_var is None:
+            raise ToolError(
+                "Private candidate queries must use a named Candidate variable in the "
+                "workspace-scoped MATCH pattern."
+            )
+        if candidate_var != scoped_candidate:
+            raise ToolError(
+                "All Candidate labels in a secure read query must use the same Candidate "
+                "variable that is scoped through Workspace."
+            )
+
+
+def _requires_workspace_scope(query: str) -> bool:
+    return _touches_private_label(query) or "$workspace_id" in query.lower()
+
+
+def _resolve_workspace_id(params: dict[str, Any]) -> str:
+    if HYREFAST_WORKSPACE_ID:
+        return HYREFAST_WORKSPACE_ID
+
+    if HYREFAST_ALLOW_WORKSPACE_ID_PARAM:
+        value = params.get("workspace_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    raise ToolError(
+        "No workspace_id is configured for secure_read_cypher. Set HYREFAST_WORKSPACE_ID, "
+        "or enable HYREFAST_ALLOW_WORKSPACE_ID_PARAM=true for temporary POC testing."
+    )
+
+
 # Runtime configuration is resolved up front so the server fails fast on bad env state.
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
@@ -215,13 +313,196 @@ NEO4J_MCP_SERVER_ALLOWED_HOSTS = _split_csv(
 )
 NEO4J_MCP_SERVER_STATELESS = _env_bool("NEO4J_MCP_SERVER_STATELESS", True)
 NEO4J_READ_ONLY = _env_bool("NEO4J_READ_ONLY", False)
+NEO4J_EXPOSE_RAW_TOOLS = _env_bool("NEO4J_EXPOSE_RAW_TOOLS", False)
 NEO4J_SCHEMA_SAMPLE_SIZE = _env_int("NEO4J_SCHEMA_SAMPLE_SIZE", 1000)
 NEO4J_READ_TIMEOUT = _env_int("NEO4J_READ_TIMEOUT", 30)
 NEO4J_RESPONSE_TOKEN_LIMIT = _env_optional_int("NEO4J_RESPONSE_TOKEN_LIMIT")
+HYREFAST_WORKSPACE_ID = os.getenv("HYREFAST_WORKSPACE_ID", "").strip()
+HYREFAST_ALLOW_WORKSPACE_ID_PARAM = _env_bool("HYREFAST_ALLOW_WORKSPACE_ID_PARAM", False)
 
 # Build the MCP app once so tool registration happens at import time.
 mcp = FastMCP("mcp-neo4j-cypher", stateless_http=True)
 namespace_prefix = _format_namespace(NEO4J_NAMESPACE)
+
+
+PRIVATE_LABELS = {
+    "Candidate",
+    "Company",
+    "Institution",
+    "Location",
+    "Language",
+    "Certification",
+    "WorkExperience",
+    "Education",
+    "Achievement",
+    "Publication",
+    "CandidateReviewItem",
+    "SkillReviewItem",
+    "NormalizationCandidate",
+    "SkillNormalizationResolution",
+}
+
+BLOCKED_READ_KEYWORDS = [
+    "CREATE",
+    "MERGE",
+    "SET",
+    "DELETE",
+    "DETACH",
+    "REMOVE",
+    "DROP",
+    "LOAD CSV",
+    "CALL DBMS",
+    "CALL APOC",
+    "CALL GDS",
+]
+
+SAFE_WORKSPACE_SCHEMA = {
+    "description": (
+        "Workspace users can query global Skill taxonomy directly. Candidate and "
+        "candidate-side data must be reached through "
+        "(:Workspace {workspace_id: $workspace_id})-[:LISTED_CANDIDATE]->(:Candidate)."
+    ),
+    "relationships": [
+        "(:Workspace)-[:LISTED_CANDIDATE]->(:Candidate)",
+        "(:Candidate)-[:HAS_SKILL]->(:Skill)",
+        "(:Candidate)-[:CURRENTLY_LOCATED_IN]->(:Location)",
+        "(:Candidate)-[:SPEAKS]->(:Language)",
+        "(:Candidate)-[:HAS_CERTIFICATION]->(:Certification)",
+        "(:Candidate)-[:HAS_EXPERIENCE]->(:WorkExperience)",
+        "(:Candidate)-[:HAS_EDUCATION]->(:Education)",
+        "(:Candidate)-[:HAS_ACHIEVEMENT]->(:Achievement)",
+        "(:Candidate)-[:AUTHORED]->(:Publication)",
+        "(:Skill)-[:BELONGS_TO_SUBCATEGORY]->(:Subcategory)",
+        "(:Subcategory)-[:BELONGS_TO_CATEGORY]->(:Category)",
+        "(:Category)-[:IN_TAXONOMY]->(:Taxonomy)",
+        "(:Skill)-[:HAS_ALIAS]->(:Alias)",
+        "(:Skill)-[:HAS_TAG]->(:Tag)",
+        "(:Skill)-[:TYPICAL_FOR_ROLE]->(:JobRole)",
+        "(:Skill)-[:RELATED_TO]->(:Skill)",
+        "(:Skill)-[:CAN_TRANSFER_TO]->(:Skill)",
+        "(:Skill)-[:PARENT_OF]->(:Skill)",
+        "(:Skill)-[:CHILD_OF]->(:Skill)",
+        "(:Skill)-[:REQUIRES]->(:Skill)",
+    ],
+    "properties": {
+        "Candidate": [
+            "first_name",
+            "middle_name",
+            "last_name",
+            "primary_email",
+            "resume_url",
+            "linkedin_url",
+            "portfolio_urls",
+            "remote_preference",
+            "employment_type_pref",
+            "shift_preference",
+            "notice_period_days",
+            "work_authorization",
+            "visa_sponsorship_needed",
+            "work_experience_snapshot",
+            "education_snapshot",
+            "certifications_snapshot",
+            "skills_snapshot",
+        ],
+        "HAS_SKILL": [
+            "raw_skill",
+            "confidence",
+            "human_review_needed",
+            "normalization_decision",
+        ],
+        "Skill": [
+            "id",
+            "canonical_name",
+            "display_name",
+            "name",
+            "aliases",
+            "tags",
+            "category",
+            "subcategory",
+            "description",
+            "typical_roles",
+            "is_language",
+            "is_software",
+        ],
+        "Category": ["slug", "name"],
+        "Subcategory": ["slug", "name"],
+    },
+}
+
+SECURE_SCHEMA_TOOL_DESCRIPTION = """
+Return the safe HyreFast workspace-user schema as JSON text.
+
+Use this tool when you need the allowed labels, relationships, or properties before
+writing a Cypher query.
+
+Input contract:
+- No arguments.
+
+Important rules:
+- This is a schema/help tool only; it does not query candidate rows.
+- Candidate and candidate-side data must be queried from Workspace:
+  MATCH (:Workspace {workspace_id: $workspace_id})-[:LISTED_CANDIDATE]->(c:Candidate)
+- Global taxonomy labels can be queried directly: Skill, Category, Subcategory,
+  Alias, Tag, JobRole, Taxonomy.
+- Do not call raw schema tools for normal workspace-user questions.
+""".strip()
+
+SECURE_READ_TOOL_DESCRIPTION = """
+Run a secure read-only Cypher query against Neo4j and return rows as JSON text.
+
+Input contract:
+- query: string, required. A read-only Cypher query.
+- params: object, optional. Query parameters other than workspace_id.
+
+Workspace contract:
+- For Candidate or candidate-side data, the query must include this exact scope pattern:
+  MATCH (:Workspace {workspace_id: $workspace_id})-[:LISTED_CANDIDATE]->(c:Candidate)
+- Use $workspace_id in the Cypher. The adapter injects its value.
+- Do not invent, request, or hard-code a workspace id in the query.
+- Do not put workspace_id in params unless the server is explicitly running temporary
+  POC mode with HYREFAST_ALLOW_WORKSPACE_ID_PARAM=true.
+
+Allowed:
+- Global taxonomy reads over Skill, Category, Subcategory, Alias, Tag, JobRole,
+  Taxonomy, and skill relationship types.
+- Workspace-scoped candidate reads.
+
+Rejected:
+- Writes or mutations: CREATE, MERGE, SET, DELETE, DETACH, REMOVE, DROP, LOAD CSV.
+- Unsafe procedure calls: CALL apoc, CALL dbms, CALL gds.
+- Candidate/private queries that do not start from Workspace LISTED_CANDIDATE.
+- Queries over all Workspace nodes or all Candidate nodes.
+
+Good candidate query shape:
+  MATCH (:Workspace {workspace_id: $workspace_id})-[:LISTED_CANDIDATE]->(c:Candidate)-[r:HAS_SKILL]->(s:Skill)
+  WHERE toLower(coalesce(s.canonical_name, "")) = $skill
+  RETURN c.first_name, c.last_name, c.primary_email, r.confidence, s.canonical_name
+  LIMIT 10
+
+Good taxonomy query shape:
+  MATCH (s:Skill)-[:BELONGS_TO_SUBCATEGORY]->(sub:Subcategory)
+  RETURN s.canonical_name, sub.name
+  LIMIT 10
+""".strip()
+
+SECURE_READ_QUERY_DESCRIPTION = """
+Read-only Cypher query.
+
+For candidate/private data, include:
+MATCH (:Workspace {workspace_id: $workspace_id})-[:LISTED_CANDIDATE]->(c:Candidate)
+
+For global taxonomy-only questions, Workspace scope is not required.
+
+Never use write clauses or unsafe procedure calls.
+""".strip()
+
+SECURE_READ_PARAMS_DESCRIPTION = """
+Optional Cypher parameters as a JSON object.
+
+Do not include workspace_id during normal operation; the adapter injects it.
+Temporary POC exception: workspace_id may be supplied only when
+HYREFAST_ALLOW_WORKSPACE_ID_PARAM=true.
+""".strip()
 
 
 def _require_env(name: str, value: str | None) -> str:
@@ -278,6 +559,92 @@ def _configure_http_transport() -> None:
 
 # Tool handlers are grouped together below in the same order the client usually reads them.
 @mcp.tool(
+    name=namespace_prefix + "secure_get_schema",
+    title="Secure Get Neo4j Schema",
+    description=SECURE_SCHEMA_TOOL_DESCRIPTION,
+    annotations=ToolAnnotations(
+        title="Secure Get Neo4j Schema",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    meta={
+        "tags": ["neo4j", "schema", "read-only", "hyrefast", "secure"],
+        "surface": "safe-schema-inspection",
+    },
+)
+async def secure_get_schema() -> CallToolResult:
+    """Return the filtered schema allowed for workspace-user Text2Cypher."""
+    _log_tool_start("secure_get_schema")
+    return _text_result(json.dumps(SAFE_WORKSPACE_SCHEMA, default=str))
+
+
+@mcp.tool(
+    name=namespace_prefix + "secure_read_cypher",
+    title="Secure Read Neo4j Cypher",
+    description=SECURE_READ_TOOL_DESCRIPTION,
+    annotations=ToolAnnotations(
+        title="Secure Read Neo4j Cypher",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    meta={
+        "tags": ["neo4j", "cypher", "read", "query", "hyrefast", "secure"],
+        "surface": "secure-data-retrieval",
+    },
+)
+async def secure_read_cypher(
+    query: str = Field(..., description=SECURE_READ_QUERY_DESCRIPTION),
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description=SECURE_READ_PARAMS_DESCRIPTION,
+    ),
+) -> CallToolResult:
+    """Execute a workspace-scoped read Cypher query on the Neo4j database."""
+    _validate_secure_read_query(query)
+
+    safe_params = dict(params or {})
+    workspace_id = None
+    if _requires_workspace_scope(query):
+        workspace_id = _resolve_workspace_id(safe_params)
+        safe_params["workspace_id"] = workspace_id
+
+    if await _is_write_query(query, safe_params):
+        raise ToolError("Only read queries are allowed for secure_read_cypher")
+
+    if workspace_id:
+        _log_tool_start("secure_read_cypher", f"for workspace {workspace_id}.")
+    else:
+        _log_tool_start("secure_read_cypher", "for global taxonomy read.")
+
+    try:
+        query_obj = Query(query, timeout=float(NEO4J_READ_TIMEOUT))
+        rows = await driver.execute_query(
+            query_obj,
+            parameters_=safe_params,
+            database_=NEO4J_DATABASE,
+            result_transformer_=lambda result: result.data(),
+        )
+    except Neo4jError as exc:
+        logger.error("Neo4j Error executing secure read query: %s\n%s\n%s", exc, query, safe_params)
+        raise ToolError(f"Neo4j Error: {exc}\n{query}\n{safe_params}") from exc
+    except Exception as exc:
+        logger.error("Error executing secure read query: %s\n%s\n%s", exc, query, safe_params)
+        raise ToolError(f"Error: {exc}\n{query}\n{safe_params}") from exc
+
+    sanitized_rows = [_value_sanitize(row) for row in rows]
+    results_json_str = json.dumps(sanitized_rows, default=str)
+    if NEO4J_RESPONSE_TOKEN_LIMIT:
+        results_json_str = _truncate_string_to_tokens(results_json_str, NEO4J_RESPONSE_TOKEN_LIMIT)
+
+    return _text_result(results_json_str)
+
+
+@_maybe_tool(
+    NEO4J_EXPOSE_RAW_TOOLS,
     name=namespace_prefix + "get_neo4j_schema",
     title="Get Neo4j Schema",
     description=(
@@ -345,7 +712,8 @@ async def get_neo4j_schema(
     return _text_result(json.dumps(schema_clean, default=str))
 
 
-@mcp.tool(
+@_maybe_tool(
+    NEO4J_EXPOSE_RAW_TOOLS,
     name=namespace_prefix + "read_neo4j_cypher",
     title="Read Neo4j Cypher",
     description=(
@@ -403,7 +771,8 @@ async def read_neo4j_cypher(
 
 if not NEO4J_READ_ONLY:
 
-    @mcp.tool(
+    @_maybe_tool(
+        NEO4J_EXPOSE_RAW_TOOLS,
         name=namespace_prefix + "write_neo4j_cypher",
         title="Write Neo4j Cypher",
         description=(
