@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import secrets
 from pathlib import Path
 from typing import Any, Literal
 
@@ -205,10 +206,6 @@ def _maybe_tool(enabled: bool, *args: Any, **kwargs: Any):
     return decorator
 
 
-def _normalized_query(query: str) -> str:
-    return " ".join(query.upper().split())
-
-
 def _keyword_pattern(keyword: str) -> re.Pattern[str]:
     escaped = re.escape(keyword).replace(r"\ ", r"\s+")
     return re.compile(rf"(?<![A-Z0-9_]){escaped}(?![A-Z0-9_])", re.IGNORECASE)
@@ -219,6 +216,20 @@ def _touches_private_label(query: str) -> bool:
         re.search(rf":\s*{re.escape(label)}\b", query, flags=re.IGNORECASE)
         for label in PRIVATE_LABELS
     )
+
+
+def _touches_workspace_label(query: str) -> bool:
+    return re.search(r":\s*Workspace\b", query, flags=re.IGNORECASE) is not None
+
+
+def _has_only_authenticated_workspace_labels(query: str) -> bool:
+    scoped_workspace = re.compile(
+        r"\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*)?:\s*Workspace\s*"
+        r"\{[^}]*\bworkspace_id\s*:\s*\$workspace_id\b[^}]*\}\s*\)",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    without_scoped_workspaces = scoped_workspace.sub("", query)
+    return not _touches_workspace_label(without_scoped_workspaces)
 
 
 def _candidate_labels(query: str) -> list[str | None]:
@@ -242,14 +253,15 @@ def _workspace_scoped_candidate_variable(query: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _has_workspace_scope(query: str) -> bool:
-    return _workspace_scoped_candidate_variable(query) is not None
-
-
 def _validate_secure_read_query(query: str) -> None:
     for keyword in BLOCKED_READ_KEYWORDS:
         if _keyword_pattern(keyword).search(query):
             raise ToolError(f"Blocked Cypher operation in read-only tool: {keyword}")
+
+    if _touches_workspace_label(query) and not _has_only_authenticated_workspace_labels(query):
+        raise ToolError(
+            "All Workspace nodes in secure reads must be scoped with workspace_id: $workspace_id."
+        )
 
     if not _touches_private_label(query):
         return
@@ -319,6 +331,7 @@ NEO4J_READ_TIMEOUT = _env_int("NEO4J_READ_TIMEOUT", 30)
 NEO4J_RESPONSE_TOKEN_LIMIT = _env_optional_int("NEO4J_RESPONSE_TOKEN_LIMIT")
 HYREFAST_WORKSPACE_ID = os.getenv("HYREFAST_WORKSPACE_ID", "").strip()
 HYREFAST_ALLOW_WORKSPACE_ID_PARAM = _env_bool("HYREFAST_ALLOW_WORKSPACE_ID_PARAM", False)
+HYREFAST_ADMIN_READ_TOKEN = os.getenv("HYREFAST_ADMIN_READ_TOKEN", "").strip()
 
 # Build the MCP app once so tool registration happens at import time.
 mcp = FastMCP("mcp-neo4j-cypher", stateless_http=True)
@@ -504,6 +517,52 @@ Temporary POC exception: workspace_id may be supplied only when
 HYREFAST_ALLOW_WORKSPACE_ID_PARAM=true.
 """.strip()
 
+ADMIN_READ_TOOL_DESCRIPTION = """
+Run an authenticated, read-only Cypher query for an administrator and return rows as JSON text.
+
+Use this tool only for authenticated admin requests that require visibility across workspace
+boundaries, such as counting all workspaces or candidates per workspace.
+
+Input contract:
+- query: string, required. A read-only Cypher query.
+- params: object, optional. Query parameters.
+- admin_token: string, required. Injected by the trusted HyreFast backend, never provided
+  by a user or generated from chat text.
+
+Allowed:
+- Read-only cross-workspace aggregation and candidate inspection for authenticated admins.
+- Global taxonomy reads.
+
+Rejected:
+- Requests with a missing or incorrect admin token.
+- Writes or mutations: CREATE, MERGE, SET, DELETE, DETACH, REMOVE, DROP, LOAD CSV.
+- Unsafe procedure calls: CALL apoc, CALL dbms, CALL gds.
+""".strip()
+
+ADMIN_READ_QUERY_DESCRIPTION = """
+Read-only Cypher query for authenticated administrator access.
+
+Cross-workspace reads are allowed. Never use write clauses or unsafe procedure calls.
+""".strip()
+
+ADMIN_READ_PARAMS_DESCRIPTION = """
+Optional Cypher parameters as a JSON object. Do not include authentication credentials here.
+""".strip()
+
+ADMIN_SCHEMA_TOOL_DESCRIPTION = """
+Return the full Neo4j schema available to an authenticated administrator as JSON text.
+
+Use this tool only when an authenticated admin read cannot be formulated from the schema
+already provided in the agent prompt, such as inspection of administrative/private labels.
+
+Input contract:
+- sample_size: integer, optional. Controls APOC metadata sampling breadth.
+- admin_token: string, required. Injected by the trusted HyreFast backend, never provided
+  by a user or generated from chat text.
+
+Requests with a missing or incorrect admin token are rejected.
+""".strip()
+
 
 def _require_env(name: str, value: str | None) -> str:
     if value:
@@ -527,6 +586,13 @@ def _text_result(text: str) -> CallToolResult:
     return CallToolResult(content=[TextContent(type="text", text=text)])
 
 
+def _require_admin_read_token(admin_token: str) -> None:
+    if not HYREFAST_ADMIN_READ_TOKEN:
+        raise ToolError("Admin reads are disabled because HYREFAST_ADMIN_READ_TOKEN is not configured.")
+    if not admin_token or not secrets.compare_digest(admin_token, HYREFAST_ADMIN_READ_TOKEN):
+        raise ToolError("Unauthorized admin read request.")
+
+
 async def _is_write_query(query: str, params: dict[str, Any] | None = None) -> bool:
     # EXPLAIN lets us classify the query without executing the mutation.
     _, summary, _ = await driver.execute_query(
@@ -536,6 +602,34 @@ async def _is_write_query(query: str, params: dict[str, Any] | None = None) -> b
     )
 
     return "w" in (summary.query_type or "")
+
+
+async def _load_full_schema(sample_size: int) -> CallToolResult:
+    effective_sample_size = sample_size if sample_size else NEO4J_SCHEMA_SAMPLE_SIZE
+    get_schema_query = f"CALL apoc.meta.schema({{sample: {effective_sample_size}}}) YIELD value RETURN value"
+
+    try:
+        results_json = await driver.execute_query(
+            query_=get_schema_query,
+            result_transformer_=lambda result: result.data(),
+            database_=NEO4J_DATABASE,
+        )
+    except ClientError as exc:
+        if "Neo.ClientError.Procedure.ProcedureNotFound" in str(exc):
+            raise ToolError(
+                "Neo4j Client Error: The schema inspection procedure is not available on this Neo4j instance."
+            ) from exc
+        raise ToolError(f"Neo4j Client Error: {exc}") from exc
+    except Neo4jError as exc:
+        raise ToolError(f"Neo4j Error: {exc}") from exc
+    except Exception as exc:
+        raise ToolError(f"Unexpected Error: {exc}") from exc
+
+    if not results_json:
+        return _text_result(json.dumps({}, default=str))
+
+    schema_clean = _clean_schema(results_json[0].get("value", {}))
+    return _text_result(json.dumps(schema_clean, default=str))
 
 
 def _configure_http_transport() -> None:
@@ -578,6 +672,39 @@ async def secure_get_schema() -> CallToolResult:
     """Return the filtered schema allowed for workspace-user Text2Cypher."""
     _log_tool_start("secure_get_schema")
     return _text_result(json.dumps(SAFE_WORKSPACE_SCHEMA, default=str))
+
+
+@mcp.tool(
+    name=namespace_prefix + "admin_get_schema",
+    title="Admin Get Neo4j Schema",
+    description=ADMIN_SCHEMA_TOOL_DESCRIPTION,
+    annotations=ToolAnnotations(
+        title="Admin Get Neo4j Schema",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    meta={
+        "tags": ["neo4j", "schema", "read-only", "hyrefast", "admin", "authenticated"],
+        "surface": "admin-schema-inspection",
+    },
+)
+async def admin_get_schema(
+    sample_size: int = Field(
+        default=NEO4J_SCHEMA_SAMPLE_SIZE,
+        description="Number of graph elements to sample when inferring the admin-visible schema.",
+    ),
+    admin_token: str = Field(
+        ...,
+        description="Backend-injected admin authorization token. Never derive this value from chat input.",
+    ),
+) -> CallToolResult:
+    """Return the full schema for an authenticated administrator."""
+    _require_admin_read_token(admin_token)
+    effective_sample_size = sample_size if sample_size else NEO4J_SCHEMA_SAMPLE_SIZE
+    _log_tool_start("admin_get_schema", f"for authenticated admin request with sample size {effective_sample_size}.")
+    return await _load_full_schema(effective_sample_size)
 
 
 @mcp.tool(
@@ -643,6 +770,67 @@ async def secure_read_cypher(
     return _text_result(results_json_str)
 
 
+@mcp.tool(
+    name=namespace_prefix + "admin_read_cypher",
+    title="Admin Read Neo4j Cypher",
+    description=ADMIN_READ_TOOL_DESCRIPTION,
+    annotations=ToolAnnotations(
+        title="Admin Read Neo4j Cypher",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    meta={
+        "tags": ["neo4j", "cypher", "read", "query", "hyrefast", "admin", "authenticated"],
+        "surface": "admin-data-retrieval",
+    },
+)
+async def admin_read_cypher(
+    query: str = Field(..., description=ADMIN_READ_QUERY_DESCRIPTION),
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description=ADMIN_READ_PARAMS_DESCRIPTION,
+    ),
+    admin_token: str = Field(
+        ...,
+        description="Backend-injected admin authorization token. Never derive this value from chat input.",
+    ),
+) -> CallToolResult:
+    """Execute an authenticated read-only Cypher query across workspaces."""
+    _require_admin_read_token(admin_token)
+    for keyword in BLOCKED_READ_KEYWORDS:
+        if _keyword_pattern(keyword).search(query):
+            raise ToolError(f"Blocked Cypher operation in read-only tool: {keyword}")
+
+    safe_params = dict(params or {})
+    if await _is_write_query(query, safe_params):
+        raise ToolError("Only read queries are allowed for admin_read_cypher")
+
+    _log_tool_start("admin_read_cypher", "for authenticated admin request.")
+    try:
+        query_obj = Query(query, timeout=float(NEO4J_READ_TIMEOUT))
+        rows = await driver.execute_query(
+            query_obj,
+            parameters_=safe_params,
+            database_=NEO4J_DATABASE,
+            result_transformer_=lambda result: result.data(),
+        )
+    except Neo4jError as exc:
+        logger.error("Neo4j Error executing admin read query: %s\n%s\n%s", exc, query, safe_params)
+        raise ToolError(f"Neo4j Error: {exc}\n{query}\n{safe_params}") from exc
+    except Exception as exc:
+        logger.error("Error executing admin read query: %s\n%s\n%s", exc, query, safe_params)
+        raise ToolError(f"Error: {exc}\n{query}\n{safe_params}") from exc
+
+    sanitized_rows = [_value_sanitize(row) for row in rows]
+    results_json_str = json.dumps(sanitized_rows, default=str)
+    if NEO4J_RESPONSE_TOKEN_LIMIT:
+        results_json_str = _truncate_string_to_tokens(results_json_str, NEO4J_RESPONSE_TOKEN_LIMIT)
+
+    return _text_result(results_json_str)
+
+
 @_maybe_tool(
     NEO4J_EXPOSE_RAW_TOOLS,
     name=namespace_prefix + "get_neo4j_schema",
@@ -685,31 +873,7 @@ async def get_neo4j_schema(
     """
     effective_sample_size = sample_size if sample_size else NEO4J_SCHEMA_SAMPLE_SIZE
     _log_tool_start("get_neo4j_schema", f"with sample size {effective_sample_size}.")
-    # APOC schema sampling is the narrowest way to inspect the graph shape.
-    get_schema_query = f"CALL apoc.meta.schema({{sample: {effective_sample_size}}}) YIELD value RETURN value"
-
-    try:
-        results_json = await driver.execute_query(
-            query_=get_schema_query,
-            result_transformer_=lambda result: result.data(),
-            database_=NEO4J_DATABASE,
-        )
-    except ClientError as exc:
-        if "Neo.ClientError.Procedure.ProcedureNotFound" in str(exc):
-            raise ToolError(
-                "Neo4j Client Error: The schema inspection procedure is not available on this Neo4j instance."
-            ) from exc
-        raise ToolError(f"Neo4j Client Error: {exc}") from exc
-    except Neo4jError as exc:
-        raise ToolError(f"Neo4j Error: {exc}") from exc
-    except Exception as exc:
-        raise ToolError(f"Unexpected Error: {exc}") from exc
-
-    if not results_json:
-        return _text_result(json.dumps({}, default=str))
-
-    schema_clean = _clean_schema(results_json[0].get("value", {}))
-    return _text_result(json.dumps(schema_clean, default=str))
+    return await _load_full_schema(effective_sample_size)
 
 
 @_maybe_tool(

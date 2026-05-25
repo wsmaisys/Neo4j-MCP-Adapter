@@ -69,6 +69,7 @@ NEO4J_RESPONSE_TOKEN_LIMIT=
 
 HYREFAST_WORKSPACE_ID=your-workspace-id
 HYREFAST_ALLOW_WORKSPACE_ID_PARAM=false
+HYREFAST_ADMIN_READ_TOKEN=a-long-random-server-to-server-secret
 ```
 
 If you want write access, change:
@@ -153,7 +154,13 @@ When deploying this adapter for HyreFast workspace-user chat, make sure Cloud Ru
 ```env
 NEO4J_READ_ONLY=true
 NEO4J_EXPOSE_RAW_TOOLS=false
+HYREFAST_ADMIN_READ_TOKEN=a-long-random-server-to-server-secret
 ```
+
+`HYREFAST_ADMIN_READ_TOKEN` enables authenticated admin tools:
+`admin_get_schema` and `admin_read_cypher`. Configure the same value in the
+HyreFast Agent service; do not expose this token in the browser or use it as
+the human administrator login token.
 
 For temporary POC testing with a UI popup that asks for `workspace_id`, use:
 
@@ -163,6 +170,8 @@ HYREFAST_ALLOW_WORKSPACE_ID_PARAM=true
 ```
 
 In this mode, the caller may pass `workspace_id` in the `secure_read_cypher` params object. This is only for POC testing because the caller controls the workspace id.
+
+Important: this is temporary Cloud Run test configuration. After testing, revert these values to the fixed server-side workspace settings below so the deployment does not stay in caller-controlled mode.
 
 For a fixed server-side workspace, use:
 
@@ -197,8 +206,14 @@ Expected tools:
 
 ```text
 secure_get_schema
+admin_get_schema
 secure_read_cypher
+admin_read_cypher
 ```
+
+The admin tools are registered for discovery, but fail closed unless
+`HYREFAST_ADMIN_READ_TOKEN` is configured and the trusted backend supplies the
+matching token.
 
 If you see raw tools like `read_neo4j_cypher`, `get_neo4j_schema`, or `write_neo4j_cypher`, check that:
 
@@ -228,6 +243,7 @@ secure_read_cypher
 `secure_read_cypher` allows flexible Text2Cypher, but enforces these rules:
 
 - Write operations are blocked.
+- Workspace nodes cannot be enumerated globally; every `Workspace` in this tool must bind `workspace_id: $workspace_id`.
 - Candidate and candidate-side labels must be scoped through `Workspace`.
 - The required candidate pattern is:
 
@@ -253,6 +269,46 @@ HYREFAST_ALLOW_WORKSPACE_ID_PARAM=true
 ```
 
 This is useful if the POC UI shows a startup popup asking for a workspace id before chat begins. Do not treat this as production tenant security, because the caller can choose the workspace id.
+
+## Authenticated admin reads
+
+The adapter also registers two authenticated administrator tools:
+
+```text
+admin_get_schema
+admin_read_cypher
+```
+
+`admin_get_schema` returns full schema metadata for admin-only/private graph
+areas when the schema already present in the Agent prompt is insufficient. It
+uses the existing APOC schema inspection path and is intentionally not
+available through the workspace-safe tool surface.
+
+`admin_read_cypher` is for administrative reporting.
+Unlike `secure_read_cypher`, it permits read-only queries across workspace
+boundaries, for example:
+
+```cypher
+MATCH (w:Workspace)
+OPTIONAL MATCH (w)-[:LISTED_CANDIDATE]->(c:Candidate)
+RETURN w.workspace_id AS workspace_id, count(c) AS candidate_count
+ORDER BY workspace_id
+```
+
+Both admin tools require `admin_token` in their MCP invocation and check it
+against the server-side `HYREFAST_ADMIN_READ_TOKEN` using a constant-time
+comparison. The HyreFast Agent injects that credential inside backend
+wrappers; the LLM and browser do not supply or see it.
+
+Recommended deployment split:
+
+```env
+# Neo4j MCP adapter only, also set to the same value in the Agent service
+HYREFAST_ADMIN_READ_TOKEN=<server-to-server-secret>
+```
+
+Keep `NEO4J_READ_ONLY=true`: `admin_read_cypher` is for global reads, not
+mutations. Missing or invalid admin-read credentials reject the request.
 
 ## Raw Neo4j tools
 

@@ -1,8 +1,13 @@
 import asyncio
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8080/mcp")
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
+
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")
 
 MCP_CONFIG = {
     "neo4j-adapter": {

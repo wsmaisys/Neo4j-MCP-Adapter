@@ -12,6 +12,31 @@ Core principle:
 Do not remove Text2Cypher. Secure it.
 ```
 
+## Implementation Status (May 25, 2026)
+
+The POC now implements the following parts of this plan:
+
+```text
+Workspace User
+  -> secure_get_schema / secure_read_cypher
+  -> hard workspace validation and workspace_id injection
+
+Authenticated Admin
+  -> admin_get_schema / admin_read_cypher for read-only cross-workspace reporting
+  -> admin-only taxonomy mutation tools in the Agent
+```
+
+`admin_get_schema` and `admin_read_cypher` are registered by the adapter and
+require `HYREFAST_ADMIN_READ_TOKEN`; admin reads also reject write operations.
+The Agent wraps the discovered remote tools and injects that server-to-server
+token outside the LLM-visible tool schema.
+The chat API separately validates `HYREFAST_REVIEW_ADMIN_TOKEN` before selecting
+the admin graph.
+
+The current UI remains a POC authentication bridge: workspace users submit a
+workspace ID and administrators submit an Agent login token. Replace this with
+real session-derived identity before production use.
+
 Target architecture:
 
 ```text
@@ -25,6 +50,8 @@ Workspace User
 ```text
 Admin User
   -> HyreFast Backend / Agent
+  -> admin_get_schema for authenticated full-schema inspection
+  -> admin_read_cypher for authenticated cross-workspace reads
   -> admin-only mutation tools
   -> role check
   -> Neo4j admin credential
@@ -40,7 +67,7 @@ Use `workspace_id`, not `id`, on `Workspace`.
 
 ---
 
-## Current Position
+## Original Starting Position
 
 The HyreFast graph already has the right tenant boundary:
 
@@ -71,11 +98,13 @@ secure_read_cypher = flexible Text2Cypher + hard workspace validation
 
 ## Final Tool Design
 
-Use three main categories of tools:
+Use five main categories of tools:
 
 ```text
 secure_read_cypher
 secure_get_schema
+admin_get_schema
+admin_read_cypher
 admin mutation tools
 ```
 
@@ -100,7 +129,30 @@ Returns a filtered, safe schema instead of raw APOC schema.
 
 Workspace users should see only the schema they are allowed to query.
 
-### 3. Admin mutation tools
+### 3. `admin_get_schema`
+
+Used only by authenticated admins when a global read requires private or
+administrative schema that is intentionally hidden from workspace users.
+
+```text
+Returns full APOC-derived schema metadata.
+HYREFAST_ADMIN_READ_TOKEN is verified by the adapter.
+The Agent injects the token outside the LLM-visible input schema.
+```
+
+### 4. `admin_read_cypher`
+
+Used only by authenticated admins for read-only reporting spanning multiple
+workspaces or all candidates.
+
+```text
+Writes are blocked.
+Cross-workspace reads are allowed.
+HYREFAST_ADMIN_READ_TOKEN is verified by the adapter.
+The Agent injects the token outside the LLM-visible input schema.
+```
+
+### 5. Admin mutation tools
 
 Used only by admins.
 
